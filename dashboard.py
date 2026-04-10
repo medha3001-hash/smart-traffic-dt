@@ -6,12 +6,22 @@ import pickle
 import time
 import random
 
+from delhi_traffic import (generate_traffic, get_traffic_label,
+                            get_junction_info, JUNCTIONS)
+from signal_optimizer import optimize_signals, get_dynamic_cycle_time
+
+# ============================================================
+# PAGE CONFIG
+# ============================================================
 st.set_page_config(
-    page_title="Smart Traffic Light Digital Twin",
+    page_title="Smart Traffic Light Digital Twin — Delhi",
     page_icon="🚦",
     layout="wide"
 )
 
+# ============================================================
+# LOAD MODEL AND DATA
+# ============================================================
 @st.cache_resource
 def load_model():
     with open('data/traffic_model.pkl', 'rb') as f:
@@ -43,204 +53,115 @@ model                           = load_model()
 stats                           = load_stats()
 hour_avg, junc_avg, hourday_avg = load_historical()
 df                              = load_traffic_data()
+junction_info                   = get_junction_info()
 
-def get_peak_status(hour):
-    if 8 <= hour <= 10:
-        return "🚨 Morning Peak Hour", True
-    elif 17 <= hour <= 20:
-        return "🚨 Evening Peak Hour", True
-    else:
-        return "🙂 Normal Traffic Hours", False
-
-def get_recommendations(result, hour):
-    recs    = []
-    counts  = result['counts']
-    levels  = result['levels']
-    green_times = result['green_times']
-    proba   = result['congestion_proba']
-    names   = ['Junction 1','Junction 2','Junction 3','Junction 4']
-    max_idx = counts.index(max(counts))
-
-    if result['congestion_pred'] == 1:
-        recs.append(
-            f"🔴 **{names[max_idx]}** has the highest load "
-            f"({counts[max_idx]} vehicles) — "
-            f"green time extended to {green_times[max_idx]}s"
-        )
-    for i, (gt, cnt) in enumerate(zip(green_times, counts)):
-        if gt <= 10 and cnt > 20:
-            recs.append(
-                f"⚠️ **{names[i]}** has {cnt} vehicles "
-                f"but only 10s green — consider manual override"
-            )
-    _, is_peak = get_peak_status(hour)
-    if is_peak and proba > 50:
-        recs.append(
-            "🕐 This is a **peak hour** — consider deploying "
-            "traffic personnel at high-load junctions"
-        )
-    if proba < 30:
-        recs.append(
-            "✅ Traffic is light — **REDUCED cycle mode** active "
-            "to minimise waiting time"
-        )
-    if not recs:
-        recs.append("✅ Traffic is flowing normally — no intervention needed")
-    return recs
-
-def get_bar_colors(levels):
-    color_map = {'HIGH':'#e74c3c','MEDIUM':'#f39c12','LOW':'#2ecc71'}
-    return [color_map[l] for l in levels]
-
-def get_level_emoji(level):
-    return {'HIGH':'🔴','MEDIUM':'🟡','LOW':'🟢'}[level]
-
+# ============================================================
+# ML PREDICTION FUNCTION
+# ============================================================
 def build_time_features(hour, day_of_week):
+    """Build the 8 features our ML model expects"""
     hist_hour = hour_avg.get(hour, hour_avg.mean())
     match = hourday_avg[
         (hourday_avg['hour'] == hour) &
         (hourday_avg['day_of_week'] == day_of_week)
     ]['Vehicles'].values
     hist_hourday = match[0] if len(match) > 0 else hist_hour
-    hist_junc  = junc_avg.mean()
-    day_avg    = hour_avg.mean()
-    hour_ratio = hist_hour / day_avg if day_avg > 0 else 1.0
-    is_weekend = 1 if day_of_week >= 5 else 0
+    hist_junc    = junc_avg.mean()
+    day_avg      = hour_avg.mean()
+    hour_ratio   = hist_hour / day_avg if day_avg > 0 else 1.0
+    is_weekend   = 1 if day_of_week >= 5 else 0
     return [[hour, day_of_week, 6, is_weekend,
              hist_hour, hist_hourday, hist_junc, hour_ratio]]
 
-def optimize_signal_timing(j1, j2, j3, j4, hour, day_of_week):
-    time_features    = build_time_features(hour, day_of_week)
-    congestion_pred  = model.predict(time_features)[0]
-    congestion_proba = model.predict_proba(time_features)[0][1]
+def get_ml_prediction(hour, day_of_week):
+    """Get congestion prediction from ML model"""
+    features         = build_time_features(hour, day_of_week)
+    pred             = model.predict(features)[0]
+    proba            = model.predict_proba(features)[0][1]
+    return pred, round(proba, 4)
 
-    if congestion_proba > 0.6:
-        total_cycle_time = 160
-        cycle_label = "EXTENDED"
-    elif congestion_proba > 0.3:
-        total_cycle_time = 120
-        cycle_label = "NORMAL"
-    elif congestion_proba > 0.15:
-        total_cycle_time = 100
-        cycle_label = "MODERATE"
+# ============================================================
+# HELPER FUNCTIONS
+# ============================================================
+def get_level_emoji(level):
+    return {'HIGH':'🔴', 'MEDIUM':'🟡', 'LOW':'🟢'}[level]
+
+def get_bar_color(level):
+    return {'HIGH':'#e74c3c', 'MEDIUM':'#f39c12', 'LOW':'#2ecc71'}[level]
+
+def get_peak_status(hour):
+    if 8 <= hour <= 10:
+        return "🚨 Morning Rush Hour", True
+    elif 17 <= hour <= 20:
+        return "🚨 Evening Peak Hour", True
     else:
-        total_cycle_time = 80
-        cycle_label = "REDUCED"
+        return "🙂 Normal Traffic Hours", False
 
-    counts         = [j1, j2, j3, j4]
-    total_vehicles = sum(counts)
-    weights        = ([c / total_vehicles for c in counts]
-                      if total_vehicles > 0
-                      else [0.25, 0.25, 0.25, 0.25])
-    green_times = [
-        max(10, min(60, round(w * total_cycle_time)))
-        for w in weights
-    ]
-
-    def get_level(c):
-        if c > 50:    return 'HIGH'
-        elif c >= 20: return 'MEDIUM'
-        else:         return 'LOW'
-
-    return {
-        'counts':           counts,
-        'levels':           [get_level(c) for c in counts],
-        'green_times':      green_times,
-        'congestion_pred':  congestion_pred,
-        'congestion_proba': round(congestion_proba * 100, 1),
-        'total_cycle_time': total_cycle_time,
-        'cycle_label':      cycle_label
-    }
-
-def draw_history_graph(hour):
-    """Draw the historical trend graph — called once per mode"""
-    hourly = df.groupby(['hour','Junction'])['Vehicles'].mean().reset_index()
-    fig, ax = plt.subplots(figsize=(12, 3))
-    colors2 = ['#2ecc71','#3498db','#e74c3c','#f39c12']
-    for junc, col in zip([1,2,3,4], colors2):
-        d = hourly[hourly['Junction'] == junc]
-        ax.plot(d['hour'], d['Vehicles'],
-                marker='o', label=f'Junction {junc}',
-                color=col, linewidth=2, markersize=3)
-    ax.axvspan(8,  10, alpha=0.1, color='red',    label='Morning peak')
-    ax.axvspan(17, 20, alpha=0.1, color='orange', label='Evening peak')
-    ax.axvline(hour, color='purple', linestyle='--',
-               linewidth=2, label=f'Current ({hour}:00)')
-    ax.set_xlabel('Hour of Day')
-    ax.set_ylabel('Average Vehicles')
-    ax.set_title('Average Vehicle Count by Hour (shaded = peak periods)')
-    ax.legend(fontsize=7, ncol=4)
-    ax.set_xticks(range(0, 24))
-    ax.grid(True, alpha=0.3)
-    st.pyplot(fig)
-    plt.close()
-
-def draw_over_time_graph():
-    """Draw the over time graph"""
-    df_sample = (df[df['Junction'] == 1]
-                   .sort_values('DateTime')
-                   .iloc[::24].copy())
-    fig, ax = plt.subplots(figsize=(12, 3))
-    ax.plot(df_sample['DateTime'], df_sample['Vehicles'],
-            color='#3498db', linewidth=1, alpha=0.8)
-    ax.fill_between(df_sample['DateTime'],
-                    df_sample['Vehicles'],
-                    alpha=0.15, color='#3498db')
-    ax.set_xlabel('Date')
-    ax.set_ylabel('Vehicles (Junction 1)')
-    ax.set_title('Traffic Volume Over Time — Junction 1 (daily sample)')
-    ax.grid(True, alpha=0.3)
-    plt.xticks(rotation=30)
-    plt.tight_layout()
-    st.pyplot(fig)
-    plt.close()
-
-def render_core(j1, j2, j3, j4, hour, day_of_week,
-                placeholders=None):
+# ============================================================
+# MAIN RENDER FUNCTION
+# ============================================================
+def render_dashboard(j1, j2, j3, j4, hour, day_of_week,
+                     placeholders=None, sim_label=None):
     """
-    Renders metrics, ML prediction, signal chart,
-    recommendations and what-if analysis.
-    Uses placeholders if provided (for simulation modes).
+    Renders the complete dashboard for given inputs.
+    - j1, j2, j3, j4: vehicle counts at each junction
+    - hour: 0-23
+    - day_of_week: 0=Monday, 6=Sunday
+    - placeholders: used in simulation modes for live updates
+    - sim_label: shows current simulation timestamp
     """
-    result    = optimize_signal_timing(j1, j2, j3, j4, hour, day_of_week)
-    use_ph    = placeholders is not None
-    proba     = result['congestion_proba']
-    bar_cols  = get_bar_colors(result['levels'])
-    peak_label, is_peak = get_peak_status(hour)
+    use_ph = placeholders is not None
 
-    # --- Peak banner ---
+    # ---- Get ML prediction ----
+    congestion_pred, congestion_proba = get_ml_prediction(
+        hour, day_of_week)
+
+    # ---- Run signal optimizer ----
+    vehicle_counts = [j1, j2, j3, j4]
+    opt = optimize_signals(vehicle_counts, congestion_proba)
+
+    # ---- Traffic label ----
+    traffic_label         = get_traffic_label(hour)
+    peak_label, is_peak   = get_peak_status(hour)
+    junction_names        = [JUNCTIONS[f'junction_{i+1}']['name']
+                              for i in range(4)]
+
+    # ----------------------------------------------------------
+    # PEAK HOUR BANNER
+    # ----------------------------------------------------------
+    def draw_peak():
+        if is_peak:
+            st.warning(f"**{peak_label}** — {traffic_label}")
+        else:
+            st.info(f"**{peak_label}** — {traffic_label}")
+
     if use_ph:
         with placeholders['peak'].container():
-            if is_peak:
-                st.warning(f"**{peak_label}** — historically high traffic period")
-            else:
-                st.info(f"**{peak_label}**")
+            draw_peak()
     else:
-        if is_peak:
-            st.warning(f"**{peak_label}** — historically high traffic period")
-        else:
-            st.info(f"**{peak_label}**")
+        draw_peak()
 
-    # --- Metrics ---
+    # ----------------------------------------------------------
+    # JUNCTION METRICS
+    # ----------------------------------------------------------
+    def draw_metrics():
+        cols = st.columns(6)
+        counts = [j1, j2, j3, j4]
+        for i, (col, name, count) in enumerate(
+                zip(cols[:4], junction_names, counts)):
+            col.metric(name, f"{count} vehicles")
+        cols[4].metric("Total", f"{sum(counts)}")
+        cols[5].metric("Hour",  f"{hour:02d}:00")
+
     if use_ph:
         with placeholders['metrics'].container():
-            c1,c2,c3,c4,c5,c6 = st.columns(6)
-            c1.metric("Junction 1", f"{j1} vehicles")
-            c2.metric("Junction 2", f"{j2} vehicles")
-            c3.metric("Junction 3", f"{j3} vehicles")
-            c4.metric("Junction 4", f"{j4} vehicles")
-            c5.metric("Total",      f"{j1+j2+j3+j4}")
-            c6.metric("Hour",       f"{hour}:00")
+            draw_metrics()
     else:
-        c1,c2,c3,c4,c5,c6 = st.columns(6)
-        c1.metric("Junction 1", f"{j1} vehicles")
-        c2.metric("Junction 2", f"{j2} vehicles")
-        c3.metric("Junction 3", f"{j3} vehicles")
-        c4.metric("Junction 4", f"{j4} vehicles")
-        c5.metric("Total",      f"{j1+j2+j3+j4}")
-        c6.metric("Hour",       f"{hour}:00")
+        draw_metrics()
 
-    # --- ML + Signal ---
+    # ----------------------------------------------------------
+    # ML PREDICTION + SIGNAL TIMINGS
+    # ----------------------------------------------------------
     if use_ph:
         signal_con = placeholders['signals'].container()
     else:
@@ -248,125 +169,221 @@ def render_core(j1, j2, j3, j4, hour, day_of_week,
 
     with signal_con:
         left, right = st.columns([1, 2])
+
         with left:
             st.subheader("🤖 ML Prediction")
-            if result['congestion_pred'] == 1:
-                conf_label = "HIGH" if proba >= 70 else "MODERATE"
-                if proba >= 70:
-                    st.error(f"🔴 CONGESTED — **{conf_label}** confidence ({proba}%)")
+            proba_pct = round(congestion_proba * 100, 1)
+
+            if congestion_pred == 1:
+                if proba_pct >= 70:
+                    st.error(
+                        f"🔴 CONGESTED — HIGH confidence ({proba_pct}%)")
                 else:
-                    st.warning(f"🟡 LIKELY CONGESTED — **{conf_label}** confidence ({proba}%)")
+                    st.warning(
+                        f"🟡 LIKELY CONGESTED — MODERATE confidence ({proba_pct}%)")
             else:
-                conf_label = "HIGH" if proba < 30 else "MODERATE"
-                if proba < 30:
-                    st.success(f"🟢 NORMAL — **{conf_label}** confidence ({100-proba:.1f}%)")
+                if proba_pct < 30:
+                    st.success(
+                        f"🟢 NORMAL — HIGH confidence ({100-proba_pct:.1f}%)")
                 else:
-                    st.info(f"🟡 LIKELY NORMAL — **{conf_label}** confidence ({100-proba:.1f}%)")
+                    st.info(
+                        f"🟡 LIKELY NORMAL — MODERATE confidence ({100-proba_pct:.1f}%)")
 
             st.markdown("**Congestion probability:**")
-            st.progress(int(proba))
-            st.caption(f"{proba}% chance of congestion at hour {hour}:00")
-            st.markdown(f"**Cycle mode:** `{result['cycle_label']}`")
-            st.markdown(f"**Total cycle time:** `{result['total_cycle_time']}s`")
-            st.caption(f"ML probability: {proba}% → cycle adjusted accordingly")
+            st.progress(int(proba_pct))
+            st.caption(
+                f"{proba_pct}% chance of congestion at hour {hour:02d}:00")
+
+            st.markdown("---")
+            st.markdown(
+                f"**Cycle mode:** `{opt['cycle_label']}`  "
+                f"**Total cycle:** `{opt['cycle_time']}s`"
+            )
+            st.caption(
+                "Cycle time is set dynamically based on total vehicle count"
+            )
+
             st.markdown("---")
             st.markdown("**Junction breakdown:**")
-            for i, (lvl, cnt, gt) in enumerate(zip(
-                    result['levels'], result['counts'], result['green_times'])):
+            for i, (name, lvl, cnt, gt) in enumerate(zip(
+                    junction_names, opt['levels'],
+                    vehicle_counts, opt['green_times'])):
                 emoji = get_level_emoji(lvl)
-                st.write(f"{emoji} **J{i+1}:** {lvl} ({cnt} vehicles) → **{gt}s** green")
+                jtype = JUNCTIONS[f'junction_{i+1}']['type']
+                st.write(
+                    f"{emoji} **{name}** ({jtype})  \n"
+                    f"  {cnt} vehicles → **{gt}s** green"
+                )
 
         with right:
             st.subheader("🚦 Optimized Signal Timings")
-            fig, ax = plt.subplots(figsize=(8, 4))
+            bar_colors = [get_bar_color(l) for l in opt['levels']]
+            fig, ax = plt.subplots(figsize=(9, 4))
             bars = ax.bar(
-                ['Junction 1','Junction 2','Junction 3','Junction 4'],
-                result['green_times'],
-                color=bar_cols, edgecolor='white', linewidth=1.5
+                junction_names,
+                opt['green_times'],
+                color=bar_colors,
+                edgecolor='white',
+                linewidth=1.5
             )
-            for bar, val, lvl in zip(bars, result['green_times'], result['levels']):
-                ax.text(bar.get_x() + bar.get_width()/2,
-                        bar.get_height() + 0.5,
-                        f'{val}s\n({lvl})',
-                        ha='center', va='bottom',
-                        fontsize=10, fontweight='bold')
+            for bar, val, lvl, cnt in zip(
+                    bars, opt['green_times'],
+                    opt['levels'], vehicle_counts):
+                ax.text(
+                    bar.get_x() + bar.get_width()/2,
+                    bar.get_height() + 0.5,
+                    f'{val}s\n{cnt} veh\n({lvl})',
+                    ha='center', va='bottom',
+                    fontsize=9, fontweight='bold'
+                )
             ax.set_ylabel('Green light duration (seconds)')
             ax.set_title(
-                f'Hour {hour}:00 — Cycle: {result["total_cycle_time"]}s '
-                f'[{result["cycle_label"]}]'
+                f'Delhi Traffic Signal Optimization | '
+                f'Hour {hour:02d}:00 | '
+                f'Cycle: {opt["cycle_time"]}s [{opt["cycle_label"]}]'
             )
             ax.set_ylim(0, 80)
-            ax.axhline(30, color='gray', linestyle='--', alpha=0.4, label='Average baseline')
+            ax.axhline(30, color='gray', linestyle='--',
+                       alpha=0.4, label='30s reference')
             ax.legend(fontsize=8)
             ax.set_facecolor('#f8f9fa')
             fig.patch.set_facecolor('#ffffff')
             st.pyplot(fig)
             plt.close()
 
-    # --- Recommendations ---
+    # ----------------------------------------------------------
+    # OPTIMIZATION LOGIC EXPLANATION
+    # ----------------------------------------------------------
     if use_ph:
-        rec_con = placeholders['recs'].container()
+        exp_con = placeholders['explanation'].container()
     else:
-        rec_con = st.container()
-    with rec_con:
-        st.markdown("---")
-        st.subheader("💡 Recommendations")
-        for r in get_recommendations(result, hour):
-            st.markdown(f"- {r}")
+        exp_con = st.container()
 
-    # --- What-if ---
+    with exp_con:
+        st.markdown("---")
+        st.subheader("📐 Optimization Logic Explanation")
+
+        col_a, col_b, col_c = st.columns(3)
+        with col_a:
+            st.markdown("**How cycle time is set:**")
+            st.caption("Total vehicles → cycle time")
+            st.caption("• > 300 vehicles → 160s EXTENDED")
+            st.caption("• > 200 vehicles → 120s NORMAL")
+            st.caption("• > 100 vehicles → 100s MODERATE")
+            st.caption("• ≤ 100 vehicles →  80s REDUCED")
+        with col_b:
+            st.markdown("**How green time is split:**")
+            st.caption(
+                "Each junction gets time proportional "
+                "to its vehicle count:"
+            )
+            st.caption(
+                "green = (my vehicles / total) × cycle time"
+            )
+            if opt['ml_adjustment']:
+                st.caption(
+                    "🤖 ML bonus applied to busiest junction")
+        with col_c:
+            st.markdown("**Current decision:**")
+            for line in opt['explanation']:
+                st.caption(line)
+
+    # ----------------------------------------------------------
+    # JUNCTION INFO CARDS
+    # ----------------------------------------------------------
     if use_ph:
-        whatif_con = placeholders['whatif'].container()
+        info_con = placeholders['info'].container()
     else:
-        whatif_con = st.container()
-    with whatif_con:
-        st.markdown("---")
-        st.subheader("🔮 What-if Analysis")
-        st.caption("What happens if traffic increases by +10 vehicles at every junction?")
-        wj1,wj2,wj3,wj4 = j1+10, j2+10, j3+10, j4+10
-        what_if  = optimize_signal_timing(wj1, wj2, wj3, wj4, hour, day_of_week)
-        wi_proba = what_if['congestion_proba']
-        wcol1, wcol2, wcol3 = st.columns(3)
-        with wcol1:
-            st.markdown("**Current**")
-            st.markdown(f"Vehicles: {j1} / {j2} / {j3} / {j4}")
-            st.markdown(f"Prediction: {'🔴 CONGESTED' if result['congestion_pred']==1 else '🟢 NORMAL'}")
-            st.markdown(f"Confidence: {proba}%")
-            st.markdown(f"Cycle: {result['total_cycle_time']}s [{result['cycle_label']}]")
-        with wcol2:
-            st.markdown("**After +10 vehicles each**")
-            st.markdown(f"Vehicles: {wj1} / {wj2} / {wj3} / {wj4}")
-            st.markdown(f"Prediction: {'🔴 CONGESTED' if what_if['congestion_pred']==1 else '🟢 NORMAL'}")
-            st.markdown(f"Confidence: {wi_proba}%")
-            st.markdown(f"Cycle: {what_if['total_cycle_time']}s [{what_if['cycle_label']}]")
-        with wcol3:
-            st.markdown("**Impact**")
-            proba_diff = wi_proba - proba
-            cycle_diff = what_if['total_cycle_time'] - result['total_cycle_time']
-            st.markdown(f"📈 Congestion risk **{'+' if proba_diff>=0 else ''}{proba_diff:.1f}%**")
-            if cycle_diff > 0:
-                st.markdown(f"⏱️ Cycle time **+{cycle_diff}s longer**")
-            elif cycle_diff < 0:
-                st.markdown(f"⏱️ Cycle time **{cycle_diff}s shorter**")
-            else:
-                st.markdown("⏱️ Cycle time **unchanged**")
-            st.markdown("Green time changes:")
-            for i, (cur, new) in enumerate(zip(result['green_times'], what_if['green_times'])):
-                diff  = new - cur
-                arrow = "↑" if diff > 0 else ("↓" if diff < 0 else "→")
-                st.caption(f"J{i+1}: {cur}s {arrow} {new}s ({'+' if diff>=0 else ''}{diff}s)")
+        info_con = st.container()
 
-    return result
+    with info_con:
+        st.markdown("---")
+        st.subheader("🗺️ Delhi Junction Profiles")
+        st.caption(
+            "Traffic patterns simulate real-world Delhi "
+            "junction behavior based on location type"
+        )
+        cols = st.columns(4)
+        for i, (col, (key, junc)) in enumerate(
+                zip(cols, JUNCTIONS.items())):
+            with col:
+                count = vehicle_counts[i]
+                level = opt['levels'][i]
+                emoji = get_level_emoji(level)
+                st.markdown(f"**{junc['name']}**")
+                st.caption(f"Type: {junc['type']}")
+                st.caption(junc['description'])
+                st.markdown(f"{emoji} {count} vehicles")
+
+    # Simulation timestamp
+    if use_ph and sim_label:
+        placeholders['siminfo'].info(
+            f"🔄 Simulating: **{sim_label}**")
+
+# ============================================================
+# HISTORICAL GRAPH FUNCTIONS
+# ============================================================
+def draw_history_graph(hour):
+    hourly = df.groupby(['hour','Junction'])['Vehicles'].mean().reset_index()
+    fig, ax = plt.subplots(figsize=(12, 3))
+    colors = ['#e74c3c','#3498db','#2ecc71','#f39c12']
+    jnames = ['ITO','Connaught Place','Lajpat Nagar','NH-48']
+    for junc, col, name in zip([1,2,3,4], colors, jnames):
+        d = hourly[hourly['Junction'] == junc]
+        ax.plot(d['hour'], d['Vehicles'],
+                marker='o', label=name,
+                color=col, linewidth=2, markersize=3)
+    ax.axvspan(8,  10, alpha=0.1, color='red',    label='Morning rush')
+    ax.axvspan(17, 20, alpha=0.1, color='orange', label='Evening peak')
+    ax.axvline(hour, color='purple', linestyle='--',
+               linewidth=2, label=f'Current ({hour:02d}:00)')
+    ax.set_xlabel('Hour of Day')
+    ax.set_ylabel('Average Vehicles')
+    ax.set_title(
+        'Historical Traffic Pattern by Hour — Delhi Junctions')
+    ax.legend(fontsize=7, ncol=4)
+    ax.set_xticks(range(0, 24))
+    ax.grid(True, alpha=0.3)
+    st.pyplot(fig)
+    plt.close()
+
+def draw_over_time_graph():
+    df_sample = (df[df['Junction'] == 1]
+                   .sort_values('DateTime')
+                   .iloc[::24].copy())
+    fig, ax = plt.subplots(figsize=(12, 3))
+    ax.plot(df_sample['DateTime'], df_sample['Vehicles'],
+            color='#e74c3c', linewidth=1, alpha=0.8,
+            label='ITO Junction')
+    ax.fill_between(df_sample['DateTime'],
+                    df_sample['Vehicles'],
+                    alpha=0.15, color='#e74c3c')
+    ax.set_xlabel('Date')
+    ax.set_ylabel('Vehicles')
+    ax.set_title('Traffic Volume Over Time — ITO Junction (daily sample)')
+    ax.legend(fontsize=8)
+    ax.grid(True, alpha=0.3)
+    plt.xticks(rotation=30)
+    plt.tight_layout()
+    st.pyplot(fig)
+    plt.close()
 
 # ============================================================
 # HEADER
 # ============================================================
-st.title("🚦 Smart Traffic Light Digital Twin")
-st.markdown("### ML-driven congestion prediction and signal optimization")
+st.title("🚦 Smart Traffic Light Digital Twin — Delhi")
+st.markdown(
+    "### ML-driven congestion prediction with proportional "
+    "signal optimization for real-world Delhi junctions"
+)
+
 c1, c2, c3 = st.columns(3)
-c1.metric("Model Accuracy",            f"{stats['model_acc']*100:.1f}%")
-c2.metric("Baseline Accuracy",         f"{stats['baseline_acc']*100:.1f}%")
-c3.metric("Improvement over baseline", f"+{stats['improvement']*100:.1f}%")
+c1.metric("Model Accuracy",
+          f"{stats['model_acc']*100:.1f}%")
+c2.metric("Baseline Accuracy",
+          f"{stats['baseline_acc']*100:.1f}%")
+c3.metric("Improvement over baseline",
+          f"+{stats['improvement']*100:.1f}%")
 st.markdown("---")
 
 # ============================================================
@@ -376,144 +393,190 @@ st.sidebar.title("⚙️ Control Panel")
 
 run_simulation = st.sidebar.checkbox(
     "▶ Run Historical Simulation",
-    help="Replays real historical data step by step"
+    help="Replays real data step by step"
 )
 if run_simulation:
-    sim_speed = st.sidebar.slider("Speed (seconds per step)", 0.05, 1.0, 0.15)
+    sim_speed = st.sidebar.slider(
+        "Speed (seconds per step)", 0.05, 1.0, 0.15)
 
 st.sidebar.markdown("---")
 live_mode = st.sidebar.toggle(
     "🔴 Enable Live Simulation Mode",
-    help="Auto-updates traffic values every few seconds"
+    help="Auto-generates realistic Delhi traffic every few seconds"
 )
 if live_mode:
-    live_speed = st.sidebar.slider("Update interval (seconds)", 1, 5, 2)
-    st.sidebar.caption("Manual sliders disabled during live mode")
+    live_speed = st.sidebar.slider(
+        "Update interval (seconds)", 1, 5, 2)
+    st.sidebar.caption("Using Delhi traffic generation model")
 
 st.sidebar.markdown("---")
 st.sidebar.markdown("**Manual mode controls**")
 if live_mode:
-    st.sidebar.caption("⚠️ Disabled — Live mode is active")
+    st.sidebar.caption("⚠️ Disabled — Live mode active")
 else:
-    st.sidebar.caption("Used when simulation is off")
+    st.sidebar.caption("Adjust traffic at each Delhi junction")
 
 hour = st.sidebar.slider("Hour of Day", 0, 23, 8)
 day_of_week = st.sidebar.selectbox(
     "Day of Week", options=[0,1,2,3,4,5,6],
-    format_func=lambda x: ['Monday','Tuesday','Wednesday',
-                            'Thursday','Friday','Saturday','Sunday'][x]
+    format_func=lambda x: [
+        'Monday','Tuesday','Wednesday',
+        'Thursday','Friday','Saturday','Sunday'][x]
 )
-j1 = st.sidebar.slider("Junction 1 vehicles", 0, 180, 80)
-j2 = st.sidebar.slider("Junction 2 vehicles", 0, 180, 60)
-j3 = st.sidebar.slider("Junction 3 vehicles", 0, 180, 40)
-j4 = st.sidebar.slider("Junction 4 vehicles", 0, 180, 20)
+
+st.sidebar.markdown("**Vehicle counts:**")
+j1 = st.sidebar.slider(
+    f"ITO",              0, 180, 80)
+j2 = st.sidebar.slider(
+    f"Connaught Place",  0, 180, 60)
+j3 = st.sidebar.slider(
+    f"Lajpat Nagar",     0, 180, 40)
+j4 = st.sidebar.slider(
+    f"NH-48",            0, 180, 30)
+
+# ============================================================
+# SYSTEM EXPLANATION BOX
+# ============================================================
+with st.expander("ℹ️ How this system works", expanded=False):
+    st.markdown("""
+    **Signal timings are dynamically optimized based on traffic distribution**
+
+    This system combines three layers of intelligence:
+
+    1. **Machine Learning (Random Forest)**
+       - Predicts congestion probability using historical time patterns
+       - Trained on 48,120 real traffic records (2015–2017)
+       - 77.7% accuracy, +37.1% improvement over baseline
+
+    2. **Dynamic Cycle Time**
+       - Total vehicles across all junctions determines the cycle length
+       - Heavy traffic → longer cycle → more time distributed
+       - Light traffic → shorter cycle → less waiting
+
+    3. **Proportional Green Time**
+       - Each junction gets green time proportional to its vehicle share
+       - Formula: `green_time = (my_vehicles / total_vehicles) × cycle_time`
+       - ML bonus: if congestion probability > 70%, busiest junction gets extra time
+
+    **Traffic patterns simulate real-world Delhi junction behavior:**
+    - ITO → major intersection, highest rush hour multiplier
+    - Connaught Place → commercial hub, busy throughout day
+    - Lajpat Nagar → residential area, moderate peaks
+    - NH-48 → highway, consistent steady flow
+    """)
 
 # ============================================================
 # MODE 1 — HISTORICAL SIMULATION
 # ============================================================
 if run_simulation and not live_mode:
     st.markdown("### 🔄 Simulation Mode — replaying historical data")
-    st.caption("The optimizer processes every real historical hour in sequence")
+    st.caption(
+        "Real historical data replayed through the Delhi "
+        "signal optimizer")
 
     df_sim = df.pivot_table(
         index=['DateTime','hour','day_of_week','month','is_weekend'],
         columns='Junction', values='Vehicles'
     ).reset_index().dropna()
-    df_sim.columns = ['DateTime','hour','day_of_week','month','is_weekend','j1','j2','j3','j4']
+    df_sim.columns = ['DateTime','hour','day_of_week',
+                      'month','is_weekend','j1','j2','j3','j4']
     df_sim = df_sim.sort_values('DateTime').reset_index(drop=True)
     df_sim = df_sim.iloc[::6].reset_index(drop=True)
 
     progress_bar = st.progress(0)
-    total_steps  = len(df_sim)
 
-    placeholders = {
-        'peak':    st.empty(),
-        'metrics': st.empty(),
-        'signals': st.empty(),
-        'recs':    st.empty(),
-        'whatif':  st.empty(),
-    }
-    sim_info = st.empty()
-
-    # Show graph ONCE before simulation starts
+    # Show graph once before loop
     st.markdown("---")
     st.subheader("📈 Historical Traffic Trend")
-    tab1, tab2 = st.tabs(["By Hour of Day", "Over Time (sample)"])
+    tab1, tab2 = st.tabs(["By Hour of Day", "Over Time"])
     with tab1:
         draw_history_graph(hour)
     with tab2:
         draw_over_time_graph()
     st.markdown("---")
 
+    placeholders = {
+        'peak':        st.empty(),
+        'metrics':     st.empty(),
+        'signals':     st.empty(),
+        'explanation': st.empty(),
+        'info':        st.empty(),
+        'siminfo':     st.empty(),
+    }
+
     for step, (_, row) in enumerate(df_sim.iterrows()):
-        render_core(
+        render_dashboard(
             j1=int(row['j1']), j2=int(row['j2']),
             j3=int(row['j3']), j4=int(row['j4']),
             hour=int(row['hour']),
             day_of_week=int(row['day_of_week']),
-            placeholders=placeholders
+            placeholders=placeholders,
+            sim_label=str(row['DateTime'])
         )
-        sim_info.info(f"🔄 Simulating: **{row['DateTime']}**")
-        progress_bar.progress(min(int((step+1)/total_steps*100), 100))
+        progress_bar.progress(
+            min(int((step+1)/len(df_sim)*100), 100))
         time.sleep(sim_speed)
 
+    st.success("✅ Simulation complete!")
+
 # ============================================================
-# MODE 2 — LIVE SIMULATION
+# MODE 2 — LIVE SIMULATION (Delhi traffic generation)
 # ============================================================
 elif live_mode and not run_simulation:
-    st.markdown("### 🔴 Live Simulation Mode")
-    st.caption("Traffic values update automatically every few seconds")
+    st.markdown("### 🔴 Live Simulation Mode — Delhi Traffic")
+    st.caption(
+        "Traffic values generated using realistic Delhi junction "
+        "models and update automatically"
+    )
 
-    col_status, col_time = st.columns([1, 1])
-    with col_status:
-        st.error(f"🔴 LIVE — Auto-updating every {live_speed} seconds")
-    with col_time:
-        st.info(f"🕐 Starting time: **{hour:02d}:00** | "
-                f"Day: **{['Mon','Tue','Wed','Thu','Fri','Sat','Sun'][day_of_week]}**")
+    col_s, col_t = st.columns([1, 1])
+    with col_s:
+        st.error(
+            f"🔴 LIVE — Auto-updating every {live_speed} seconds")
+    with col_t:
+        st.info(
+            f"🕐 Starting: **{hour:02d}:00** | "
+            f"**{['Mon','Tue','Wed','Thu','Fri','Sat','Sun'][day_of_week]}**"
+        )
 
-    if 'live_j1' not in st.session_state:
-        st.session_state.live_j1 = j1
-        st.session_state.live_j2 = j2
-        st.session_state.live_j3 = j3
-        st.session_state.live_j4 = j4
-
-    placeholders = {
-        'peak':    st.empty(),
-        'metrics': st.empty(),
-        'signals': st.empty(),
-        'recs':    st.empty(),
-        'whatif':  st.empty(),
-    }
-    sim_info = st.empty()
-
-    # History graph shown ONCE — static reference
+    # Show graph once — static reference
     st.markdown("---")
-    st.subheader("📈 Historical Traffic Trend")
-    tab1, tab2 = st.tabs(["By Hour of Day", "Over Time (sample)"])
+    st.subheader("📈 Historical Traffic Trend — Reference")
+    tab1, tab2 = st.tabs(["By Hour of Day", "Over Time"])
     with tab1:
         draw_history_graph(hour)
     with tab2:
         draw_over_time_graph()
+    st.markdown("---")
+
+    placeholders = {
+        'peak':        st.empty(),
+        'metrics':     st.empty(),
+        'signals':     st.empty(),
+        'explanation': st.empty(),
+        'info':        st.empty(),
+        'siminfo':     st.empty(),
+    }
 
     live_step = 0
     while live_mode:
-        st.session_state.live_j1 = max(0, min(180, st.session_state.live_j1 + random.randint(-5, 5)))
-        st.session_state.live_j2 = max(0, min(180, st.session_state.live_j2 + random.randint(-5, 5)))
-        st.session_state.live_j3 = max(0, min(180, st.session_state.live_j3 + random.randint(-5, 5)))
-        st.session_state.live_j4 = max(0, min(180, st.session_state.live_j4 + random.randint(-5, 5)))
-
         simulated_hour = (hour + live_step // 10) % 24
 
-        render_core(
-            j1=st.session_state.live_j1,
-            j2=st.session_state.live_j2,
-            j3=st.session_state.live_j3,
-            j4=st.session_state.live_j4,
+        # Generate realistic Delhi traffic for this hour
+        traffic = generate_traffic(simulated_hour, day_of_week)
+        lj1 = traffic['junction_1']['count']
+        lj2 = traffic['junction_2']['count']
+        lj3 = traffic['junction_3']['count']
+        lj4 = traffic['junction_4']['count']
+
+        render_dashboard(
+            j1=lj1, j2=lj2, j3=lj3, j4=lj4,
             hour=simulated_hour,
             day_of_week=day_of_week,
-            placeholders=placeholders
+            placeholders=placeholders,
+            sim_label=f"Live step {live_step+1} | "
+                      f"Hour {simulated_hour:02d}:00"
         )
-        sim_info.info(f"🔄 Live step {live_step + 1} | Hour {simulated_hour:02d}:00")
         live_step += 1
         time.sleep(live_speed)
 
@@ -521,10 +584,10 @@ elif live_mode and not run_simulation:
 # MODE 3 — MANUAL MODE
 # ============================================================
 else:
-    render_core(j1, j2, j3, j4, hour, day_of_week)
+    render_dashboard(j1, j2, j3, j4, hour, day_of_week)
     st.markdown("---")
     st.subheader("📈 Historical Traffic Trend")
-    tab1, tab2 = st.tabs(["By Hour of Day", "Over Time (sample)"])
+    tab1, tab2 = st.tabs(["By Hour of Day", "Over Time"])
     with tab1:
         draw_history_graph(hour)
     with tab2:
@@ -535,7 +598,7 @@ else:
 # ============================================================
 st.markdown("---")
 st.caption(
-    "Smart Traffic Light Digital Twin · "
+    "Smart Traffic Light Digital Twin — Delhi | "
     "Python · Scikit-learn · Streamlit · "
-    "Random Forest · Chronological validation"
+    "Random Forest · Proportional Signal Optimization"
 )
